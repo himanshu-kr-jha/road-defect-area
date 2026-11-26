@@ -1,0 +1,10 @@
+.venv/
+out/
+__pycache__/
+.pytest_cache/
+*.pt
+*.pth
+*.onnx
+*.mp4
+*.gpx
+outlines.json

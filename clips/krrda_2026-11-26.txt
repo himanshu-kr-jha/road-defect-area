@@ -1,0 +1,6 @@
+# KRRDA Bangalore, 2026-11-26 06:48, two phones on the same ride (upload_queue 5986b3d5..., 1511d842...).
+# Both phones were HANDHELD by the pillion rider, so the height changes during the clip: these test the pipeline,
+# not the milestones. 1.152 is a placeholder height; replace it with the measured lens height when known.
+# name          video                                                                                 gpx                                                                                   height_m
+krrda_22423 s3://photons-bucket-s3/cog-geo-snap-videos/field-captures/krrdaadmin_cognecto.com/2026-11-26/22423_KRRDA_Bangalore_Road_KRRDA_Bangalore_Road_s20261126_064819_20261126_064819_seg001.mp4 s3://photons-bucket-s3/cog-geo-snap-videos/field-captures/krrdaadmin_cognecto.com/2026-11-26/22423_KRRDA_Bangalore_Road_KRRDA_Bangalore_Road_s20261126_064819_20261126_064819_seg001.gpx 1.152
+krrda_32769 s3://photons-bucket-s3/cog-geo-snap-videos/field-captures/krrdaadmin_cognecto.com/2026-11-26/32769_KRRDA_Bangalore_Blr_Bangalore_s20261126_064813_20261126_064813_seg001.mp4 s3://photons-bucket-s3/cog-geo-snap-videos/field-captures/krrdaadmin_cognecto.com/2026-11-26/32769_KRRDA_Bangalore_Blr_Bangalore_s20261126_064813_20261126_064813_seg001.gpx 1.152

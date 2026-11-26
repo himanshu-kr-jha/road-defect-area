@@ -1,0 +1,8 @@
+numpy>=2
+scipy>=1.14
+pandas>=2.2
+opencv-python-headless>=4.10,<5
+matplotlib>=3.9
+imageio-ffmpeg>=0.5
+ultralytics-opencv-headless
+pytest>=8

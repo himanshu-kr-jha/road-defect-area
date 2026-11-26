@@ -1,0 +1,7 @@
+# One row per measured defect. Metres, not centimetres.
+# length_m: along the road (direction of travel). width_m: across the road. Longest extent in each direction.
+# area_m2: optional, the real area if you measured it properly (for example from a grid of widths). Leave empty otherwise.
+# track_ids: optional. Leave empty if you will draw the defect in label.html with the same name.
+name,length_m,width_m,area_m2,track_ids
+P1,0.60,0.45,,
+P2,0.85,0.70,0.44,
