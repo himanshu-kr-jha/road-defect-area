@@ -80,6 +80,8 @@ def scene(tmp_path_factory):
 
 class PerfectDetector:
     """Stands in for the model: the exact bounding box of every defect, in whichever frame it is shown."""
+    device = "cpu"
+
     def __init__(self, *_):
         self.k = 0
 
@@ -183,3 +185,153 @@ def test_gpx_with_too_few_points_is_refused(tmp_path):
     (tmp_path / "g.gpx").write_text('<gpx><trkpt lat="1" lon="2"><time>2026-11-26T00:00:00Z</time></trkpt></gpx>')
     with pytest.raises(SystemExit, match="at least 4|At least 4"):
         ra.Gpx(tmp_path / "g.gpx", 10)
+
+
+# ----------------------------------------------------------------------------- merged videos and existing rows (rescore)
+
+def _gpx_text(segments, t0=datetime(2026, 11, 26, 6, 0, tzinfo=timezone.utc)):
+    """segments: list of (start offset in s, speed function, seconds). Points once a second, heading north."""
+    out = []
+    for start, v, secs in segments:
+        lat, pts = 13.0, []
+        for s in range(secs + 1):
+            pts.append(f'<trkpt lat="{lat:.9f}" lon="77.5"><time>{(t0 + timedelta(seconds=start + s)).isoformat()}</time></trkpt>')
+            lat += v(s + .5) / 111320
+        out.append("<trkseg>" + "".join(pts) + "</trkseg>")
+    return "<gpx><trk>" + "".join(out) + "</trk></gpx>"
+
+
+def test_merged_gpx_segments_are_laid_end_to_end(tmp_path):
+    (tmp_path / "g.gpx").write_text(_gpx_text([(0, lambda s: 4.0, 10), (3600, lambda s: 8.0, 10)]))
+    g = ra.Gpx(tmp_path / "g.gpx", 20.0)
+    assert len(g.segments) == 2 and abs(g.gpx_seconds - 20) < 1e-6
+    assert abs(g.speed(5) - 4) < .2 and abs(g.speed(15) - 8) < .2      # the hour between them is not video
+
+
+def test_cut_finder_spots_the_jump_between_recordings_only():
+    rng = np.random.default_rng(3)
+    a, b = rng.integers(0, 255, (36, 64)), rng.integers(0, 255, (36, 64))
+    f = ra.CutFinder(30.0)
+    cuts = [i for i in range(200) if f.push(i, np.clip((a if i < 120 else b) + rng.normal(0, 4, a.shape) + i % 7, 0, 255).astype(np.uint8))]
+    assert cuts == [120]
+
+
+def test_each_recording_is_aligned_to_its_gpx_segment_by_speed(tmp_path):
+    v1 = lambda s: 5 + 3 * math.sin(s / 7) + 1.5 * math.sin(s / 2.3)
+    v2 = lambda s: 6 + 2.5 * math.sin(s / 5) + math.cos(s / 3.1)
+    (tmp_path / "g.gpx").write_text(_gpx_text([(0, v1, 120), (4000, v2, 90)]))
+    fps, gap, H, rng = 30.0, 9, 1.2, np.random.default_rng(0)
+    g = ra.Gpx(tmp_path / "g.gpx", 150.0)
+    # video: 80 s of segment 1 from its 17th second, then 70 s of segment 2 from its 4th second
+    truth = [(0, 80, 0, 17.0), (80, 150, 1, 4.0)]
+    recs = []
+    for i in range(0, int(150 * fps), 3):
+        t = (i - gap / 2) / fps
+        lo, hi, seg, off = next(p for p in truth if p[0] <= t < p[1]) if t >= 0 else truth[0]
+        v = np.interp(off + t - lo, g.segments[seg].t, g.segments[seg].v)
+        recs.append(dict(frame=i, hrel=H / (v * gap / fps) * math.exp(rng.normal(0, .05))))
+    got = ra.align_gpx(recs, g, [0, int(80 * fps), int(150 * fps)], fps, gap)
+    for p, (lo, _, seg, off) in zip(got, truth):
+        assert p["gpx_segment"] == seg and abs(p["gpx_offset_s"] - off) <= .5 and p["speed_match"] > .8
+
+
+def test_an_evidence_image_finds_its_frame():
+    rng = np.random.default_rng(1)
+    base = cv2.GaussianBlur(rng.integers(0, 255, (1080, 1920)).astype(np.uint8), (0, 0), 9)
+    frames = [np.roll(base, 6 * i, axis=1) for i in range(60)]
+    thumbs = np.array([ra.thumb(cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)) for f in frames])
+    ev = cv2.imdecode(cv2.imencode(".jpg", cv2.cvtColor(frames[37], cv2.COLOR_GRAY2BGR), [cv2.IMWRITE_JPEG_QUALITY, 70])[1], 1)
+    k, e, e2 = ra.find_frame(ev, thumbs, 30.0)
+    assert k == 37 and e < ra.FRAME_MATCH_MAX
+
+
+def test_stored_area_picks_its_box_and_road_clipping_is_kept():
+    det = lambda img, conf: [dict(label="pothole", conf=.8, box=[0, 0, 100, 100]), dict(label="pothole", conf=.8, box=[0, 0, 300, 200]),
+                             dict(label="Ravelling", conf=.6, box=[0, 0, 50, 40])]
+    rows = pd.DataFrame(dict(nlabel=["pothole", "pothole", "ravelling"],
+                             defect_area_m2=[300 * 200 / 145 ** 2, .6 * 100 * 100 / 145 ** 2, 2000 / 145 ** 2]), index=[7, 8, 9])
+    b = ra.recover_boxes(rows, None, det)
+    assert b[7][0] == [0, 0, 300, 200] and b[7][1] == 1.0
+    assert b[8][0] == [0, 0, 100, 100] and abs(b[8][1] - .6) < 1e-9
+    assert b[9][0] == [0, 0, 50, 40]
+
+
+class EvidenceDetector(PerfectDetector):
+    """The perfect detector for a picture taken out of the video: it finds the frame by its look first."""
+    thumbs = None
+
+    def __call__(self, frame, conf):
+        self.k = ra.find_frame(frame, self.thumbs, FPS)[0] // 3
+        return super().__call__(frame, conf)
+
+
+def test_rescore_gives_existing_rows_the_tracked_area(result, tmp_path):
+    import shutil
+    out = tmp_path / "run"
+    shutil.copytree(result[0], out)
+    vid, frames = cv2.VideoCapture(str(result[0].parent / "v.mp4")), []
+    while True:
+        ok, f = vid.read()
+        if not ok:
+            break
+        frames.append(f)
+    (tmp_path / "img").mkdir()
+    rows = []
+    for n, (cx, cz, ln, wd) in DEFECTS.items():
+        i = next(i for i in range(0, N, 3) if 9 < cz - SPEED * i / FPS < 11)             # first stored when 10 m away, as production does
+        p, _ = project(i, outline(n))
+        px = np.ptp(p[:, 0]) * np.ptp(p[:, 1])
+        cv2.imwrite(str(tmp_path / "img" / f"pothole_frame{i}.jpg"), frames[i])
+        rows.append(dict(id=100 + len(rows), job_id="J1", label="Pothole", frame_url=f"defect_frame_images/pothole_frame{i}.jpg",
+                         defect_area_m2=round(px / 145 ** 2, 4), estimated_cost_inr=round(px / 145 ** 2 * 1200, 2), true=ln * wd, name=n))
+    first = rows[0]
+    rows.append(dict(first, id=200, true=first["true"]))                                  # the same pothole stored twice
+    rows.append(dict(first, id=201, label="Garbage Pile", estimated_cost_inr=50))          # not flat on the road
+    cv2.imwrite(str(tmp_path / "img" / "noise.jpg"), np.random.default_rng(0).integers(0, 255, (HH, W, 3)).astype(np.uint8))
+    rows.append(dict(first, id=202, frame_url="defect_frame_images/noise.jpg"))           # a picture from another video
+    pd.DataFrame(rows).drop(columns=["true", "name"]).to_csv(tmp_path / "rows.csv", index=False)
+
+    EvidenceDetector.thumbs = np.load(out / "thumbs.npy")
+    ra.Detector, keep = EvidenceDetector, ra.Detector
+    try:
+        path = ra.main(["rescore", "--rows", str(tmp_path / "rows.csv"), "--out", str(out), "--images", str(tmp_path / "img"), "--model", __file__])
+    finally:
+        ra.Detector = keep
+    R = pd.read_csv(path, dtype={"same_defect_as_id": str})
+    src = pd.read_csv(tmp_path / "rows.csv")
+    assert list(R.id) == list(src.id) and set(src.columns) <= set(R.columns)                # no row added, dropped or reordered
+    assert (R.defect_area_m2 == src.defect_area_m2).all()                                   # the old value stays as it was
+    pot = R[R.id < 200].assign(true=[r["true"] for r in rows[:4]])
+    assert (pot.area_changed == "yes").all() and pot.track_id.nunique() == 4
+    assert ((pot.defect_area_m2_new / pot.true - 1).abs() < .2).all(), pot[["defect_area_m2", "defect_area_m2_new", "true"]]
+    assert ((pot.defect_area_m2 / pot.true - 1).abs() > .3).any()                           # the old area was off
+    assert (pot.estimated_cost_inr_new / pot.defect_area_m2_new / 1200 - 1).abs().max() < .02     # cost follows the area at the stored rate
+    dup, garbage, other = (R[R.id == k].iloc[0] for k in (200, 201, 202))
+    assert dup.same_defect_as_id == "100" and dup.track_id == pot.track_id.iloc[0]
+    assert garbage.area_changed == "no" and garbage.estimated_cost_inr_new == 50 and "above the road" in garbage.note
+    assert other.area_changed == "no" and "not in this video" in other.note
+    assert (out / R.defect_image.dropna().iloc[0]).is_file()
+
+
+def test_rescore_reads_the_workers_own_csv_by_frame_number(result, tmp_path):
+    """The worker's per-video CSV has object_id, frame and defect_name, and no evidence image."""
+    import shutil
+    out = tmp_path / "run"
+    shutil.copytree(result[0], out)
+    rows = []
+    for n, (cx, cz, ln, wd) in DEFECTS.items():
+        i = next(i for i in range(1, N, 3) if 9 < cz - SPEED * i / FPS < 11)              # a frame the run did not analyse
+        p, _ = project(i, outline(n))
+        rows.append(dict(object_id=len(rows) + 1, frame=i, timestamp="00:01", defect_name="Pothole",
+                         defect_area_m2=round(np.ptp(p[:, 0]) * np.ptp(p[:, 1]) / 145 ** 2, 4), true=ln * wd))
+    pd.DataFrame(rows).drop(columns="true").to_csv(tmp_path / "video_defect.csv", index=False)
+    EvidenceDetector.thumbs = np.load(out / "thumbs.npy")
+    ra.Detector, keep = EvidenceDetector, ra.Detector
+    try:
+        path = ra.main(["rescore", "--rows", str(tmp_path / "video_defect.csv"), "--out", str(out), "--video", str(result[0].parent / "v.mp4"), "--model", __file__])
+    finally:
+        ra.Detector = keep
+    R = pd.read_csv(path)
+    assert path.name == "video_defect_new_area.csv" and list(R.columns[:6]) == ["object_id", "frame", "timestamp", "defect_name", "defect_area_m2", "defect_area_m2_new"]
+    assert (R.area_changed == "yes").all() and R.track_id.nunique() == 4
+    assert ((R.defect_area_m2_new / [r["true"] for r in rows] - 1).abs() < .2).all()

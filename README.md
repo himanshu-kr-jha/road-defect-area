@@ -74,6 +74,76 @@ This takes seconds, because the model is not run again.
 Open `out/test1/report.html`.
 Without drawing outlines, put the IDs from `annotated.mp4` into the `track_ids` column instead.
 
+## New area for a job already in post_construction_output
+
+`rescore` keeps every row of a finished job and adds the corrected area next to the old one.
+It never adds or removes a row.
+It analyses the whole video once, working out the coefficient in every analysed frame as above.
+It then finds each stored row in that run and gives it the final area of the same tracked defect.
+
+1. Export the job's rows, and look up its video and GPX, in the Photons database (read only):
+
+   ```sql
+   \copy (select * from post_construction_output where job_id = 'B8R5K2M9X4P7N3Q' order by id) to 'B8R5K2M9X4P7N3Q.csv' csv header
+   select input_video_s3_uri, gpx_s3_uri from video_processing_jobs where job_id = 'B8R5K2M9X4P7N3Q';
+   ```
+
+2. Run it with the same model the job used.
+   The keys in the table have no bucket, so put `s3://photons-bucket-s3/` in front of them:
+
+   ```bash
+   .venv/bin/python road_area.py rescore --rows B8R5K2M9X4P7N3Q.csv --job-id B8R5K2M9X4P7N3Q \
+     --video s3://photons-bucket-s3/cog-geo-snap-videos/... --gpx s3://photons-bucket-s3/cog-geo-snap-videos/....gpx \
+     --height 1.152 --model model.pt --out out/B8R5K2M9X4P7N3Q --aws-profile pothole-ro
+   ```
+
+The answer is `out/<job>/post_construction_output_<job>_new_area.csv`.
+It has every column of the input, unchanged, plus these:
+
+| Column | Meaning |
+| --- | --- |
+| `defect_area_m2_new` | The corrected area. It equals the old area when the row could not be corrected (see `note`) |
+| `area_changed` | `yes` when the row got a new area |
+| `new_over_old`, `estimated_cost_inr_new` | The change. Cost follows the area only for classes whose stored cost is a fixed rate per m2 |
+| `confidence`, `views_used`, `spread`, `distance_m`, `length_m`, `width_m` | As in `defects.csv`, for the tracked defect |
+| `same_defect_as_id` | This row is the same tracked defect as an earlier row |
+| `note` | Why the old area was kept, or what to check |
+| `video_frame`, `track_id`, `box_*`, `defect_image` | Where the row was found in the video, and its sheet in `defects/` |
+
+The worker's own per-video CSV works too (`object_id, frame, defect_name, defect_area_m2, ...`, no `frame_url`).
+Its frame numbers count from the start of the video, so the script reads those frames from `--video` and needs no evidence images:
+
+```bash
+.venv/bin/python road_area.py rescore --rows <video>_defect.csv --video <video>.mp4 --model model.pt --out out/<name>
+```
+
+When `--out` already holds a `run` of that video (for example `out/krrda_22423` from `run_clips.sh`), the video is not analysed again.
+
+How each row is found:
+
+- Its evidence image (`frame_url`) is matched to a video frame by its look, because frame numbers in the file names do not count from the start of a merged video.
+- The model is run on the evidence image to get the row's box back.
+  Production keeps only the area, which is the box's pixels divided by 145², so the box whose pixels fit is the row's box.
+- That box is matched to the box drawn by the run within two analysed frames, which gives the tracked defect.
+  The model sometimes calls one spot by another class in the next frames (pothole, then patching).
+  When no box of the row's class is there, a box of another class on the same spot is used, the confidence drops one step, and `note` says so.
+- A row the model saw on only one frame, below the confidence that starts a track, has no tracked defect: it keeps its old area.
+- If the stored area is smaller than the box (the part off the road was dropped), the new area is reduced in the same proportion.
+
+The old area is kept for sign boards and garbage piles, which stand above the road.
+It is also kept when the evidence image is not in the video (for example, a trimmed part of a merged video), and when the defect was never seen close enough.
+
+A merged video holds several recordings, and its GPX holds one track segment per recording.
+The script finds where the video jumps from one recording to the next.
+It then lines each recording up with its GPX segment by matching the camera's own speed to the GPS speed (`speed match` in the output, 1 is perfect).
+Each recording keeps its own f*H.
+
+`rescore` saves the analysed video in `--out`.
+Running it again on the same `--out`, for example with a corrected CSV, takes minutes, not the whole video again.
+Pass `--rerun` to analyse the video again.
+Analysed frames are kept in `--out/frames` for the defect images: about 3 GB for a 10-minute video.
+`run.json` records whether the model ran on `cuda` or `cpu`, and how long the analysis took.
+
 ## Outputs
 
 | File | What it holds |

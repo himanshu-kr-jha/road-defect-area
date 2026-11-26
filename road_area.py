@@ -3,6 +3,7 @@
 
     road_area.py run      --video V --gpx G --height 1.152 --model M --out OUT [--truth truth.csv]
     road_area.py evaluate --out OUT --truth truth.csv [--outlines outlines.json]
+    road_area.py rescore  --rows post_construction_output.csv --video V --gpx G --height 1.152 --model M --out OUT
 
 `run` reads the video once. In that single pass it detects the defects and works out, in each
 analysed frame, the coefficient that turns a box's pixel area into square metres. `evaluate`
@@ -25,8 +26,8 @@ import math
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
+import time
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
@@ -126,40 +127,112 @@ def measure_box(b, n, cam, scale):
 
 # ----------------------------------------------------------------------------- GPX
 
-class Gpx:
-    """Speed against video time."""
+class GpxSegment:
+    """One <trkseg>: speed and position against seconds since its first point."""
 
-    def __init__(self, path, duration, offset=None):
-        pts, text = [], Path(path).read_text()
-        for m in re.finditer(r"<trkpt\b([^>]*)>(.*?)</trkpt>", text, re.S):
-            lat, lon = (re.search(rf'\b{k}\s*=\s*["\']([-\d.]+)', m[1]) for k in ("lat", "lon"))
-            t = re.search(r"<time>\s*(.*?)\s*</time>", m[2], re.S)
-            if lat and lon and t:
-                pts.append((datetime.fromisoformat(t[1].replace("Z", "+00:00")).timestamp(), float(lat[1]), float(lon[1])))
-        pts = sorted({p[0]: p for p in pts}.values())
-        if len(pts) < 4:
-            raise SystemExit(f"GPX {path}: only {len(pts)} timed points. At least 4 are needed.")
-        P = np.array(pts)
-        self.n, self.duration = len(P), duration
-        T = P[:, 0] - P[0, 0]
-        self.gpx_seconds = float(T[-1])
+    def __init__(self, P):
+        self.T = P[:, 0] - P[0, 0]
+        self.lat, self.lon, self.seconds = P[:, 1], P[:, 2], float(self.T[-1])
         x = (P[:, 2] - P[0, 2]) * 111320 * math.cos(math.radians(P[0, 1]))
         y = (P[:, 1] - P[0, 1]) * 111320
         self.metres = float(np.hypot(np.diff(x), np.diff(y)).sum())
-        v = np.hypot(np.diff(x), np.diff(y)) / np.maximum(np.diff(T), 0.2)
+        v = np.hypot(np.diff(x), np.diff(y)) / np.maximum(np.diff(self.T), 0.2)
         self.v = gaussian_filter1d(median_filter(v, min(5, len(v) | 1), mode="nearest"), 1.0, mode="nearest")
-        self.t = (T[1:] + T[:-1]) / 2
-        # The app starts and stops both together, so by default the GPX is stretched over the video.
-        self.map = (lambda s: s * T[-1] / duration) if offset is None else (lambda s: s + offset)
-        self.start_lat_lon = (T, P[:, 1], P[:, 2])
+        self.t = (self.T[1:] + self.T[:-1]) / 2
+
+
+class Gpx:
+    """Speed against video time. A merged video comes with one GPX segment per recording, so video time is mapped
+    piece by piece: piece = (first video second, GPX segment, GPX seconds at that video second)."""
+
+    def __init__(self, path, duration, offset=None):
+        text = Path(path).read_text()
+        self.segments = []
+        for seg in re.findall(r"<trkseg\b.*?</trkseg>", text, re.S) or [text]:
+            pts = []
+            for m in re.finditer(r"<trkpt\b([^>]*)>(.*?)</trkpt>", seg, re.S):
+                lat, lon = (re.search(rf'\b{k}\s*=\s*["\']([-\d.]+)', m[1]) for k in ("lat", "lon"))
+                t = re.search(r"<time>\s*(.*?)\s*</time>", m[2], re.S)
+                if lat and lon and t:
+                    pts.append((datetime.fromisoformat(t[1].replace("Z", "+00:00")).timestamp(), float(lat[1]), float(lon[1])))
+            pts = sorted({p[0]: p for p in pts}.values())
+            if len(pts) >= 4:
+                self.segments.append(GpxSegment(np.array(pts)))
+        self.n = sum(len(s.T) for s in self.segments)
+        if not self.segments:
+            raise SystemExit(f"GPX {path}: fewer than 4 timed points in every track segment. At least 4 are needed.")
+        self.duration = duration
+        self.gpx_seconds = float(sum(s.seconds for s in self.segments))
+        self.metres = float(sum(s.metres for s in self.segments))
+        if offset is not None:
+            self.pieces = [(0.0, 0, float(offset), 1.0)]
+        else:
+            # The app starts and stops both together, so by default the GPX is stretched over the video. Segments are
+            # laid end to end without the time between them, which is what merging the videos does.
+            k, at, self.pieces = self.gpx_seconds / duration, 0.0, []
+            for i, s in enumerate(self.segments):
+                self.pieces.append((at / k, i, 0.0, k))
+                at += s.seconds
+
+    def _piece_at(self, sec):
+        return max((p for p in self.pieces if p[0] <= sec + 1e-9), key=lambda p: p[0], default=self.pieces[0])
+
+    def _where(self, sec):
+        p = self._piece_at(sec)
+        return self.segments[p[1]], p[2] + (sec - p[0]) * p[3]
 
     def speed(self, sec):
-        return float(np.interp(self.map(sec), self.t, self.v))
+        s, t = self._where(sec)
+        return float(np.interp(t, s.t, s.v))
 
     def position(self, sec):
-        T, la, lo = self.start_lat_lon
-        s = self.map(sec)
-        return float(np.interp(s, T, la)), float(np.interp(s, T, lo))
+        s, t = self._where(sec)
+        return float(np.interp(t, s.T, s.lat)), float(np.interp(t, s.T, s.lon))
+
+
+def _video_speed(recs, k, fps, gap):
+    """Times and log speed of the camera, known only up to one factor: the distance moved over the baseline is the
+    camera height divided by `hrel`, and the height does not change."""
+    fr = np.array([r["frame"] for r in recs])[k]
+    h = np.array([r["hrel"] for r in recs])[k]
+    ok = np.isfinite(h) & (h > 0)
+    if ok.sum() < 9:
+        return np.array([]), np.array([])
+    return (fr[ok] - gap / 2) / fps, median_filter(-np.log(h[ok]), 9, mode="nearest")
+
+
+def _corr(t, L, seg, start_s, offset):
+    tt = offset + (t - start_s)
+    v = np.interp(tt, seg.t, seg.v)
+    ok = (tt >= 0) & (tt <= seg.seconds) & (v > 1.0)
+    if ok.sum() < max(30, .6 * len(t)):
+        return -1.0, int(ok.sum())
+    return float(np.corrcoef(L[ok], np.log(v[ok]))[0, 1]), int(ok.sum())
+
+
+def speed_match(recs, k, gpx, fps, gap):
+    """How well the camera's own speed follows the GPX speed as currently mapped (correlation, 1 is perfect)."""
+    t, L = _video_speed(recs, k, fps, gap)
+    v = np.array([gpx.speed(x) for x in t])
+    ok = v > 1.0
+    return round(float(np.corrcoef(L[ok], np.log(v[ok]))[0, 1]), 3) if ok.sum() >= 30 else None
+
+
+def align_gpx(recs, gpx, bounds, fps, gap):
+    """For each recording in the video, the GPX segment and offset whose speed rises and falls with the camera's."""
+    fr = np.array([r["frame"] for r in recs])
+    out = []
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        t, L = _video_speed(recs, (fr >= lo + gap) & (fr < hi), fps, gap)
+        start, dur, best = lo / fps, (hi - lo) / fps, (-1.0, 0, 0.0)
+        for si, s in enumerate(gpx.segments):
+            for o in np.arange(-.5 * dur, s.seconds - .5 * dur + .25, .25):
+                c, _ = _corr(t, L, s, start, o) if len(t) else (-1.0, 0)
+                if c > best[0]:
+                    best = (c, si, float(o))
+        out.append(dict(start_s=start, gpx_segment=best[1], gpx_offset_s=best[2], speed_match=round(best[0], 3)))
+        print(f"  video {start:.0f}-{start + dur:.0f} s follows GPX segment {best[1] + 1} from {best[2]:.1f} s (speed match {best[0]:.2f})", flush=True)
+    return out
 
 
 # ----------------------------------------------------------------------------- camera motion
@@ -452,6 +525,32 @@ def fetch(src, folder, name, profile):
     return p
 
 
+THUMB = (64, 36)
+
+
+def thumb(frame):
+    """Tiny grey copy of a frame: enough to find a frame again from its picture."""
+    return cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), THUMB, interpolation=cv2.INTER_AREA)
+
+
+class CutFinder:
+    """Spots the jump where one recording ends and the next begins in a merged video."""
+
+    def __init__(self, fps):
+        self.prev, self.d, self.last, self.min_gap = None, [], -10 ** 9, int(5 * fps)
+
+    def push(self, i, th):
+        th, cut = th.astype(np.int16), False
+        if self.prev is not None:
+            x = float(np.abs(th - self.prev).mean())
+            base = float(np.median(self.d[-30:])) if len(self.d) >= 10 else np.inf
+            if x > 25 and x > 6 * max(base, 1.0) and i - self.last > self.min_gap:
+                cut, self.last = True, i
+            self.d.append(x)
+        self.prev = th
+        return cut
+
+
 class Video:
     """Sequential reader. Never seeks: phone video has a variable frame rate and seeking by number lands elsewhere."""
 
@@ -512,19 +611,30 @@ def _run(a, out, video, gpxfile):
     if vid.count / vid.fps < 20:
         warnings.append("Short clip: on past recordings a 10 s clip put about 2% (up to 6.5%) error on the GPX scale.")
 
+    t_start = time.time()
     det, motion = Detector(a.model, a.device, a.imgsz), Motion(cam, step, gap)
+    print(f"model {Path(a.model).name} on {det.device}", flush=True)
+    use_patches = getattr(a, "patches", True)
     patches, tracker = PatchTracker(cam, step, vid.fps), Tracker(a.conf, int(round(vid.fps / step)))
-    recs, boxes, live, fh_seen, n_frames = [], [], [], [], 0
+    recs, boxes, live, fh_seen, thumbs, cuts, n_frames = [], [], [], [], [], [], 0
+    cut_finder, piece_k = CutFinder(vid.fps), 0
     for i, frame in enumerate(vid):
         n_frames += 1
-        patches.push(i, frame)
+        thumbs.append(thumb(frame))
+        if cut_finder.push(i, thumbs[-1]):
+            # A merged video jumps to the next recording here: nothing tracked before the jump carries over.
+            cuts.append(i)
+            motion, tracker.tracks, patches.live, piece_k = Motion(cam, step, gap), {}, [], len(recs)
+            print(f"  frame {i}: the video jumps to another recording", flush=True)
+        if use_patches:
+            patches.push(i, frame)
         r = motion.push(i, frame)
         if r is None:
             continue
         recs.append(r)
         k = len(recs) - 1
         # ---- the coefficient "on the go": only this frame and earlier ones are used
-        n_live = smooth_normal(recs, k, win, causal=True)
+        n_live = smooth_normal(recs[piece_k:], k - piece_k, win, causal=True)
         x = estimate_fh([r], gpx, cam, vid.fps, gap)[0]
         if np.isfinite(x):
             fh_seen.append(x)
@@ -540,32 +650,61 @@ def _run(a, out, video, gpxfile):
             print(f"  frame {i}/{vid.count}  defects tracked {tracker.next - 1}", flush=True)
     if n_frames != vid.count:
         warnings.append(f"Video header says {vid.count} frames; {n_frames} were readable.")
+    np.save(out / "thumbs.npy", np.array(thumbs))
 
     # ---- second look, with the whole clip available
+    bounds = [0] + cuts + [n_frames]
+    if len(gpx.segments) > 1 or cuts:
+        found = align_gpx(recs, gpx, bounds, vid.fps, gap)
+        if len(cuts) + 1 != len(gpx.segments):
+            warnings.append(f"The GPX has {len(gpx.segments)} track segments but the video {len(cuts) + 1} recordings: each recording was matched to the GPX by its speed.")
+        for p in found:
+            if p["speed_match"] < .3:
+                warnings.append(f"Video from {p['start_s']:.0f} s: its speed does not follow any GPX segment (match {p['speed_match']:.2f}); the scale there is less certain.")
+        old = [gpx._piece_at(p["start_s"]) for p in found]
+        gpx.pieces = [(p["start_s"], p["gpx_segment"], p["gpx_offset_s"], 1.0) if p["speed_match"] >= .3 else
+                      (p["start_s"], q[1], q[2] + (p["start_s"] - q[0]) * q[3], q[3]) for p, q in zip(found, old)]
     fh_all = estimate_fh(recs, gpx, cam, vid.fps, gap)
     good = fh_all[np.isfinite(fh_all)]
     if len(good) < 5 and not a.fh:
         raise SystemExit("Could not recover the camera motion in enough frames (blurred, static or turning video?). Pass --fh to continue.")
     fh = a.fh or (a.focal * a.height if a.focal else float(np.median(good)))
     halves = [float(np.median(x)) for x in np.array_split(good, 2)] if len(good) >= 10 else []
-    if halves and abs(halves[0] - halves[1]) / fh > .10:
+    rec_frames = np.array([r["frame"] for r in recs])
+    pieces, normals = [], []
+    for j, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:])):
+        k = (rec_frames >= lo) & (rec_frames < hi)
+        normals += fill_normals([r for r, kk in zip(recs, k) if kk], win)
+        x = fh_all[k & np.isfinite(fh_all)]
+        g = gpx._piece_at(lo / vid.fps)
+        pieces.append(dict(start_frame=int(lo), end_frame=int(hi), gpx_segment=g[1], gpx_offset_s=round(g[2], 2), gpx_rate=g[3],
+                           speed_match=speed_match(recs, k, gpx, vid.fps, gap),
+                           fh=a.fh or (a.focal * a.height if a.focal else float(np.median(x)) if len(x) >= 20 else fh), fh_frames=int(len(x))))
+    if len(pieces) == 1 and halves and abs(halves[0] - halves[1]) / fh > .10:
         warnings.append(f"f*H differs between the first and second half of the clip ({halves[0]:.0f} vs {halves[1]:.0f}): scale is less certain.")
-    normals = fill_normals(recs, win)
+    if len(pieces) > 1:
+        f = [p["fh"] for p in pieces]
+        if max(f) / min(f) > 1.10:
+            warnings.append("f*H differs between the recordings in this video (" + ", ".join(f"{x:.0f}" for x in f) + "): each recording uses its own.")
     N = [n for n in normals if n is not None]
     n_fixed = np.median(N, 0) / np.linalg.norm(np.median(N, 0))
     meta = dict(video=str(a.video).split("?")[0], gpx=str(a.gpx).split("?")[0], fps=vid.fps, frames=n_frames, width=vid.w, height=vid.h,
                 source_size=vid.src, step=step, gap=gap, working_focal=cam.f, camera_height_m=a.height, fh=fh,
                 fh_source="--fh" if a.fh else "--focal x height" if a.focal else "GPX", fh_gpx=float(np.median(good)) if len(good) else None,
                 fh_halves=halves, implied_focal=fh / a.height, gpx_points=gpx.n, gpx_seconds=gpx.gpx_seconds, gpx_metres=gpx.metres,
+                gpx_segments=len(gpx.segments), pieces=pieces,
                 speed_kmh=v * 3.6, warnings=warnings, n_fixed=n_fixed.tolist(), planes_found=int(len(N)), planes_total=len(recs),
-                model=str(a.model), conf=a.conf, imgsz=a.imgsz)
+                model=str(a.model), conf=a.conf, imgsz=a.imgsz, device=det.device, seconds=round(time.time() - t_start))
     P = pd.DataFrame([dict(frame=r["frame"], time_s=r["frame"] / vid.fps, nx=n[0] if n is not None else np.nan, ny=n[1] if n is not None else np.nan,
                            nz=n[2] if n is not None else np.nan, horizon_row=horizon(n, cam)[0] if n is not None else np.nan,
                            roll_deg=horizon(n, cam)[1] if n is not None else np.nan, speed_kmh=gpx.speed(r["frame"] / vid.fps) * 3.6,
                            fh_this_frame=x, road_points=r["inliers"]) for r, n, x in zip(recs, normals, fh_all)]).merge(pd.DataFrame(live), on="frame")
     P.to_csv(out / "per_frame.csv", index=False)
     pd.DataFrame(boxes, columns="frame track_id label conf x1 y1 x2 y2 live_area".split()).to_csv(out / "detections.csv", index=False)
-    patches.rows({r["frame"]: n for r, n in zip(recs, normals)}, cam, Scale(a.height, fh)).to_csv(out / "patches.csv", index=False)
+    if use_patches:
+        patches.rows({r["frame"]: n for r, n in zip(recs, normals)}, cam, Scale(a.height, fh)).to_csv(out / "patches.csv", index=False)
+    else:
+        pd.DataFrame(columns="track_id frame distance_m pixels area_old area_new".split()).to_csv(out / "patches.csv", index=False)
     (out / "run.json").write_text(json.dumps(meta, indent=1))
 
 
@@ -576,7 +715,18 @@ def load(out):
     cam = Camera(meta["working_focal"], meta["width"], meta["height"])
     P = pd.read_csv(out / "per_frame.csv")
     normals = {int(r.frame): np.array([r.nx, r.ny, r.nz]) for r in P.itertuples() if np.isfinite(r.ny)}
-    return meta, cam, Scale(meta["camera_height_m"], meta["fh"]), P, normals
+    return meta, cam, Scales(meta), P, normals
+
+
+class Scales:
+    """The scale of each frame. A merged video holds several recordings, and each keeps its own f*H."""
+
+    def __init__(self, meta):
+        P = meta.get("pieces") or [dict(start_frame=0, fh=meta["fh"])]
+        self.starts, self.s = [p["start_frame"] for p in P], [Scale(meta["camera_height_m"], p["fh"]) for p in P]
+
+    def at(self, frame):
+        return self.s[max(0, int(np.searchsorted(self.starts, frame, side="right")) - 1)]
 
 
 def coefficient_rows(out, trim=(0.0, 0.0)):
@@ -590,9 +740,10 @@ def coefficient_rows(out, trim=(0.0, 0.0)):
         tx, ty = min(trim[0], .4 * (r.x2 - r.x1)), min(trim[1], .4 * (r.y2 - r.y1))
         b = (r.x1 + tx, r.y1 + ty, r.x2 - tx, r.y2 - ty)
         px = (r.x2 - r.x1) * (r.y2 - r.y1)
-        m = measure_box(b, n, cam, scale) if n is not None else None
-        m0 = measure_box(b0, n, cam, scale) if n is not None else None
-        f = measure_box(b, nf, cam, scale)
+        sc = scale.at(r.frame)
+        m = measure_box(b, n, cam, sc) if n is not None else None
+        m0 = measure_box(b0, n, cam, sc) if n is not None else None
+        f = measure_box(b, nf, cam, sc)
         area = m["area"] if m else np.nan
         live_area = r.live_area * (m["area"] / m0["area"] if m and m0 else 1.0)
         rows.append(dict(track_id=r.track_id, label=r.label, frame=r.frame, time_s=r.frame / meta["fps"], conf=r.conf, x1=r.x1, y1=r.y1, x2=r.x2, y2=r.y2,
@@ -723,7 +874,7 @@ def truth_rows(truth, C, outlines, normals, cam, scale):
             if len(x):
                 o.update(model_area=x.area_new.median(), model_length=x.length_m.median(), model_width=x.width_m.median(), model_views=len(x),
                          old_area=C[C.track_id.isin(ids)].sort_values("frame").area_old.iloc[0])
-        ms = [m for q in mine if (m := measure(q["points"], normals.get(int(q["frame"])), cam, scale))]
+        ms = [m for q in mine if (m := measure(q["points"], normals.get(int(q["frame"])), cam, scale.at(int(q["frame"]))))]
         if ms:
             o.update(hand_area=np.median([m["area"] for m in ms]), hand_length=np.median([m["length"] for m in ms]),
                      hand_width=np.median([m["width"] for m in ms]), hand_views=len(ms))
@@ -1137,6 +1288,312 @@ def write_report(out, meta, C, F, P, patches, S, T):
         "th{background:#f1f3f6}.s{overflow-x:auto;margin:12px 0}.w{background:#fff4d6;padding:8px 12px;border-radius:6px}img{max-width:100%}.g{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,520px),1fr));gap:12px}.g img{border:1px solid #d5d9e0;border-radius:4px}pre{background:#f1f3f6;padding:10px;overflow-x:auto}</style>" + "\n".join(body))
 
 
+# ----------------------------------------------------------------------------- new area for existing detections
+
+LABEL_ALIASES = {"longitudial crack": "longitudinal crack"}
+FRAME_MATCH_MAX = 4.0      # mean grey difference of the thumbnails; JPEG noise alone gives about 2
+NEED_COLUMNS = ("id", "label", "defect_area_m2")
+COLUMN_ALIASES = {"id": "object_id", "label": "defect_name"}     # the worker's own per-video CSV
+
+
+def norm_label(s):
+    s = re.sub(r"[_\s]+", " ", str(s).strip().lower())
+    return LABEL_ALIASES.get(s, s)
+
+
+def _local_name(url):
+    return re.sub(r"[^\w.-]+", "_", url.split("?")[0].strip("/"))
+
+
+def fetch_images(urls, folder, base, profile):
+    """Evidence images by their frame_url, into `folder`. `base` is a local folder, or the S3 or http(s) location the
+    frame_url is relative to. Images already there are not fetched again."""
+    folder.mkdir(parents=True, exist_ok=True)
+    got, s3 = {}, {}
+    for u in sorted(set(urls)):
+        dst = folder / _local_name(u)
+        if dst.is_file() and dst.stat().st_size:
+            got[u] = dst
+        elif base and not re.match(r"(s3|https?)://", base):
+            for p in (Path(base).expanduser() / u, Path(base).expanduser() / u.rsplit("/", 1)[-1]):
+                if p.is_file():
+                    shutil.copy(p, dst)
+                    got[u] = dst
+                    break
+        elif re.match(r"https?://", u) or (base or "").startswith("http"):
+            try:
+                with urllib.request.urlopen(u if re.match(r"https?://", u) else base.rstrip("/") + "/" + u.lstrip("/")) as r, open(dst, "wb") as f:
+                    shutil.copyfileobj(r, f)
+                got[u] = dst
+            except OSError as e:
+                print("  could not fetch", u, e)
+        else:
+            key = u if u.startswith("s3://") else base.rstrip("/") + "/" + u.lstrip("/")
+            s3.setdefault(key.rsplit("/", 1)[0], []).append((key.rsplit("/", 1)[1], u, dst))
+    for d, files in s3.items():          # one call per folder: hundreds of single copies would take minutes
+        print(f"  fetching {len(files)} images from {d}/", flush=True)
+        with tempfile.TemporaryDirectory(dir=folder) as tmp:
+            inc = [x for name, _, _ in files for x in ("--include", name)]
+            subprocess.run(["aws", "s3", "cp", d + "/", tmp, "--recursive", "--only-show-errors", "--exclude", "*", *inc]
+                           + (["--profile", profile] if profile else []), check=True)
+            for name, u, dst in files:
+                if (Path(tmp) / name).is_file():
+                    shutil.move(Path(tmp) / name, dst)
+                    got[u] = dst
+    return got
+
+
+def find_frame(img, thumbs, fps):
+    """The video frame an evidence image was taken from: (frame, error, error of the best frame more than a second away)."""
+    z = thumb(img).reshape(-1).astype(np.int16)
+    e = np.concatenate([np.abs(thumbs[i:i + 20000].reshape(-1, z.size).astype(np.int16) - z).mean(1) for i in range(0, len(thumbs), 20000)])
+    k = int(e.argmin())
+    w = max(1, int(fps))
+    rest = np.r_[e[:max(0, k - w)], e[k + w + 1:]]
+    return k, float(e[k]), float(rest.min()) if len(rest) else np.inf
+
+
+def recover_boxes(rows, img, det):
+    """Production keeps no box, only area = pixels / 145^2. Running the same model on the same picture gives the
+    boxes back; within one picture and class, each row takes the box whose pixel count fits its area."""
+    found = det(img, .05)
+    out = {}
+    for lab, g in rows.groupby("nlabel"):
+        q = [x for x in found if norm_label(x["label"]) == lab]
+        if not q:
+            continue
+        px = g.defect_area_m2.values * PROD_PPM ** 2
+        bp = np.array([(x["box"][2] - x["box"][0]) * (x["box"][3] - x["box"][1]) for x in q])
+        # A stored area can be smaller than its box (the part off the road is dropped), never larger.
+        cost = np.array([[abs(math.log(max(p, 1) / b)) + (0 if x["conf"] >= .3 else .5) + (1 if p > b * 1.1 else 0) for b, x in zip(bp, q)] for p in px])
+        for i, j in zip(*linear_sum_assignment(cost)):
+            frac = px[i] / bp[j]
+            if .2 < frac < 1.1:
+                out[g.index[i]] = (q[j]["box"], min(frac, 1.0), q[j]["conf"])
+    return out
+
+
+def video_frames(want, folder, video, profile):
+    """The given frames of the video as images in `folder` (at the working width), reading the video once."""
+    folder.mkdir(parents=True, exist_ok=True)
+    path = lambda k: folder / f"frame_{k:06d}.jpg"
+    todo = {k for k in want if not path(k).is_file()}
+    if todo:
+        print(f"  reading {len(todo)} frames from the video", flush=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            for i, f in enumerate(Video(fetch(video, Path(tmp), "video.mp4", profile))):
+                if i in todo:
+                    cv2.imwrite(str(path(i)), f, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    todo.discard(i)
+                    if not todo:
+                        break
+    return {k: path(k) for k in want if path(k).is_file()}
+
+
+def link_track(C, frame, lab, box, step):
+    """The track in this run that drew the same box within a couple of analysed frames. The model sometimes calls one
+    spot by another class in the next frames (pothole, then patching), so a box of another class on the same spot
+    (overlap at least half) is taken when no box of the row's class is there."""
+    near = C[(C.frame - frame).abs() <= 2 * step]
+    for same, floor in ((True, .3), (False, .5)):
+        best = (floor, None)
+        for r in near[(near.nlabel == lab) == same].itertuples():
+            s = iou(box, (r.x1, r.y1, r.x2, r.y2)) - .02 * abs(r.frame - frame) / step
+            if s > best[0]:
+                best = (s, r)
+        if best[1] is not None:
+            return best[1]
+    return None
+
+
+def rescore(a):
+    """New area for the defects already in a post_construction_output CSV. The whole video is analysed once for the
+    per-frame coefficient; each stored row is then found in it and given the area of its tracked defect. No row is
+    added or removed."""
+    out = Path(a.out).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+    rows = pd.read_csv(a.rows, dtype=str, keep_default_na=False)
+    if a.job_id:
+        rows = rows[rows.get("job_id", pd.Series("", index=rows.index)) == a.job_id]
+    d = rows.copy()
+    for c, alias in COLUMN_ALIASES.items():
+        if c not in d and alias in d:
+            d[c] = d[alias]
+    # Where a row was taken: its evidence image (frame_url), or else its frame number in this very video.
+    by_frame = ("frame_url" not in d or not d.frame_url.str.strip().any()) and "frame" in d
+    has_box = all(c in d for c in ("x", "y", "width", "height"))
+    missing = [c for c in NEED_COLUMNS if c not in d] + ([] if by_frame or "frame_url" in d else ["frame_url or frame"])
+    if missing or not len(rows):
+        raise SystemExit(f"{a.rows}: " + (f"needs columns {missing}" if missing else "no rows" + (f" for job {a.job_id}" if a.job_id else "")))
+    if not (out / "run.json").is_file() or a.rerun:
+        if not (a.video and a.gpx and a.height and a.model):
+            raise SystemExit("first run on this --out: --video, --gpx, --height and --model are needed")
+        if not .3 <= a.height <= 4:
+            raise SystemExit("--height is in metres, for example 1.152")
+        (out / "frames").mkdir(exist_ok=True)
+        a.patches = False
+        with tempfile.TemporaryDirectory() as tmp:
+            video = fetch(a.video, Path(tmp), "video.mp4", a.aws_profile)
+            shutil.copy(fetch(a.gpx, Path(tmp), "track.gpx", a.aws_profile), out / "track.gpx")
+            _run(a, out, video, out / "track.gpx")
+    else:
+        print(f"reusing the analysed video in {out} (pass --rerun to analyse it again)")
+    meta, cam, _, _, _ = load(out)
+    C = coefficient_rows(out)
+    F = final_areas(C)
+    C.to_csv(out / "coefficients.csv", index=False)
+    F.to_csv(out / "defects.csv", index=False)
+    C["nlabel"] = C.label.map(norm_label)
+    step = meta["step"]
+
+    d["defect_area_m2"] = pd.to_numeric(d.defect_area_m2, errors="coerce")
+    d["nlabel"] = d.label.map(norm_label)
+    if by_frame:
+        d["frame"] = pd.to_numeric(d.frame, errors="coerce")
+        key = "frame"
+        print(f"{len(d)} rows, located by their frame number in the video", flush=True)
+        imgs = {} if has_box else video_frames(sorted({int(f) for f in d.frame.dropna()}), out / "evidence", a.video or meta["video"], a.aws_profile)
+    else:
+        key = "frame_url"
+        print(f"{len(d)} rows; fetching their evidence images", flush=True)
+        imgs = fetch_images(d.frame_url, out / "evidence", a.images, a.aws_profile)
+        thumbs = np.load(out / "thumbs.npy")
+    model = a.model or Path(meta["model"])
+    if not has_box and not model.is_file():
+        raise SystemExit(f"model not found: {model}. Pass --model with the model this video was analysed with.")
+    det = None if has_box else Detector(model, a.device, meta.get("imgsz", 640))
+    R = pd.DataFrame(index=d.index, columns="video_frame frame_match track_id frac x1 y1 x2 y2 how note".split(), dtype=object)
+    R["note"] = ""
+    for src, g in d.groupby(key):
+        img = cv2.imread(str(imgs[src])) if src in imgs else None
+        if by_frame:
+            k, sx = int(src), meta["width"] / (img.shape[1] if img is not None else meta["source_size"][0])
+            R.loc[g.index, "video_frame"] = k
+        else:
+            if img is None:
+                R.loc[g.index, "note"] = "evidence image not found"
+                continue
+            k, e, e2 = find_frame(img, thumbs, meta["fps"])
+            sx = meta["width"] / img.shape[1]
+            R.loc[g.index, "video_frame"], R.loc[g.index, "frame_match"] = k, round(e, 2)
+            if e > FRAME_MATCH_MAX or e2 < 1.5 * e:
+                R.loc[g.index, "note"] = "evidence image is not in this video" if e > FRAME_MATCH_MAX else "evidence image matches several moments of the video"
+                continue
+        flat = g[~g.nlabel.isin(UPRIGHT) & g.defect_area_m2.gt(0)]
+        if has_box:      # the worker's CSV keeps the box: nothing to recover
+            boxes = {}
+            for i, r in flat.iterrows():
+                x, y, w, h = (float(r[c]) for c in ("x", "y", "width", "height"))
+                if w > 0 and h > 0:
+                    boxes[i] = ([x, y, x + w, y + h], min(1.0, r.defect_area_m2 * PROD_PPM ** 2 / (w * h)), np.nan)
+        elif img is None:
+            R.loc[g.index, "note"] = "frame not found in the video"
+            continue
+        else:
+            boxes = recover_boxes(flat, img, det) if len(flat) else {}
+        for i in g.index:
+            if d.nlabel[i] in UPRIGHT:
+                R.loc[i, "note"] = "stands above the road: flat-road geometry does not apply"
+                continue
+            if i in boxes:
+                b, frac, _ = boxes[i]
+                b = [v * sx for v in b]
+                t, how = link_track(C, k, d.nlabel[i], b, step), "same box"
+            else:
+                # No box of this class fits: fall back to the run's own box of the same class and size nearby.
+                px = d.defect_area_m2[i] * PROD_PPM ** 2 * sx * sx
+                x = C[(C.nlabel == d.nlabel[i]) & ((C.frame - k).abs() <= step)]
+                x = x.assign(err=np.log(px / x.pixels).abs()) if len(x) and px > 0 else x.iloc[:0]
+                t = x.loc[x.err.idxmin()] if len(x) and x.err.min() < math.log(1.3) else None
+                b, frac, how = None, (min(1.0, px / t.pixels) if t is not None else np.nan), "same class and size"
+            if t is None:
+                R.loc[i, "note"] = "the model did not find this box again in the video" if i in boxes else "no box of this class and size in the evidence image"
+                continue
+            R.loc[i, ["track_id", "frac", "how"]] = [int(t.track_id), frac, how]
+            R.loc[i, ["x1", "y1", "x2", "y2"]] = [round(float(v), 1) for v in (b or (t.x1, t.y1, t.x2, t.y2))]
+
+    Fi = F.set_index("track_id")
+    new, conf, notes = [], [], []
+    for i in d.index:
+        t, n = R.track_id[i], R.note[i]
+        f = Fi.loc[t] if pd.notna(t) and t in Fi.index else None
+        if f is None or not np.isfinite(f.area_new):
+            new.append(np.nan)
+            conf.append("")
+            notes.append(n or (f.note if f is not None else ""))
+            continue
+        new.append(f.area_new * R.frac[i])
+        exact = R.how[i] == "same box" and norm_label(f.label) == d.nlabel[i]
+        conf.append(f.confidence if exact else {"high": "medium"}.get(f.confidence, "low"))
+        notes.append("; ".join(x for x in (f.note, "box partly off the road: scaled by the stored pixels" if R.frac[i] < .9 else "",
+                                           f"the model called this spot {f.label} in the frames around it" if norm_label(f.label) != d.nlabel[i] else "",
+                                           "matched by class and size only" if R.how[i] != "same box" else "") if x))
+    d["new"], d["conf"], d["note"] = new, conf, notes
+    # Two rows on one tracked defect are the same defect seen twice; the later ones say so.
+    first, d["same_as"] = {}, ""
+    for i in d.sort_values("id", key=lambda s: pd.to_numeric(s, errors="coerce")).index:
+        t = R.track_id[i]
+        if pd.notna(t):
+            if t in first:
+                d.loc[i, "same_as"] = d.id[first[t]]
+            else:
+                first[t] = i
+    for p, q in same_place(C):           # one spot drawn under two class names
+        if p in first and q in first:
+            j = first[q]
+            d.loc[j, "note"] = "; ".join(x for x in (d.note[j], f"same place as row {d.id[first[p]]}") if x)
+
+    # Cost: only where this file's own cost is a fixed rate per m2 for the class, so it scales with the area.
+    cost = pd.to_numeric(d["estimated_cost_inr"], errors="coerce") if "estimated_cost_inr" in d else pd.Series(np.nan, index=d.index)
+    rate = cost / d.defect_area_m2
+    linear = rate.groupby(d.nlabel).transform(lambda r: bool(r.notna().all() and r.min() > 0 and r.max() / r.min() < 1.01)).astype(bool)
+    used = sorted({int(t) for t in R.track_id.dropna()})
+    sheets = defect_images(out, C, F[F.track_id.isin(used)]) if used else {}
+
+    res = rows.copy()
+    at = list(res.columns).index("defect_area_m2") + 1
+    res.insert(at, "defect_area_m2_new", np.where(d.new.notna(), d.new.round(4), d.defect_area_m2))
+    res.insert(at + 1, "area_changed", np.where(d.new.notna(), "yes", "no"))
+    ratio = d.new / d.defect_area_m2
+    num = lambda s, k: pd.to_numeric(R.track_id.map(Fi[s]), errors="coerce").round(k)
+    extra = dict(new_over_old=ratio.round(3), estimated_cost_inr_new=np.where(linear & d.new.notna(), (d.new * rate).round(2), cost),
+                 confidence=d.conf, length_m=num("length_m", 2), width_m=num("width_m", 2), distance_m=num("distance_m", 2),
+                 views_used=R.track_id.map(Fi.views_used), spread=num("spread", 3), same_defect_as_id=d.same_as, note=d.note,
+                 video_frame=R.video_frame, frame_match=R.frame_match, track_id=R.track_id, box_x1=R.x1, box_y1=R.y1, box_x2=R.x2, box_y2=R.y2,
+                 defect_image=R.track_id.map(lambda t: sheets.get(t, "") if pd.notna(t) else ""))
+    for k, v in extra.items():
+        res[k] = v
+    big = d.new.notna() & ((ratio > 8) | (ratio < .1))
+    res.loc[big, "confidence"] = "low"
+    res.loc[big, "note"] = (res.note[big] + "; ").str.lstrip("; ") + "large change, check by eye"
+    if a.job_id or ("job_id" in rows and rows.job_id.nunique() == 1):
+        path = out / f"post_construction_output_{a.job_id or rows.job_id.iloc[0]}_new_area.csv"
+    else:
+        path = out / f"{Path(a.rows).stem}_new_area.csv"
+    res.to_csv(path, index=False)
+
+    ok = d.new.notna()
+    S = dict(rows=len(d), updated=int(ok.sum()), confidence=res.confidence[ok].value_counts().to_dict(),
+             kept_old=res.note[~ok].replace("", "no usable view").value_counts().to_dict(), same_defect_rows=int((d.same_as != "").sum()),
+             by_class={k: dict(rows=len(g), updated=int(g.new.notna().sum()), old_m2=round(float(g.defect_area_m2.sum()), 2),
+                               new_m2=round(float(np.where(g.new.notna(), g.new, g.defect_area_m2).sum()), 2),
+                               median_new_over_old=round(float((g.new / g.defect_area_m2).median()), 3) if g.new.notna().any() else None)
+                       for k, g in d.groupby("label")},
+             pieces=meta.get("pieces"), warnings=meta["warnings"], csv=path.name)
+    (out / "rescore.json").write_text(json.dumps(S, indent=1, default=str))
+    print(f"\n=== {S['updated']} of {S['rows']} rows got a new area; confidence {S['confidence']}")
+    for k, v in S["kept_old"].items():
+        print(f"kept the old area ({v} rows): {k}")
+    print(pd.DataFrame(S["by_class"]).T.to_string())
+    for p in meta.get("pieces") or []:
+        print(f"video frames {p['start_frame']}-{p['end_frame']}: GPX segment {p['gpx_segment'] + 1} from {p['gpx_offset_s']} s, "
+              f"speed match {p['speed_match']}, f*H {p['fh']:.0f}")
+    for w in meta["warnings"]:
+        print("WARNING:", w)
+    print("wrote", path)
+    return path
+
+
 # ----------------------------------------------------------------------------- command line
 
 def main(argv=None):
@@ -1165,14 +1622,34 @@ def main(argv=None):
     for q in (r, e):
         q.add_argument("--trim-x", type=float, default=0.0, help="px taken off the left and right of every box")
         q.add_argument("--trim-y", type=float, default=0.0, help="px taken off the top and bottom of every box")
+    s = sub.add_parser("rescore", help="new area for the rows of an existing post_construction_output CSV")
+    s.add_argument("--rows", required=True, help="post_construction_output CSV (needs id, label, frame_url, defect_area_m2)")
+    s.add_argument("--job-id", help="only the rows of this job_id")
+    s.add_argument("--video", help="the video the job processed: path, http(s) URL or s3:// URI")
+    s.add_argument("--gpx", help="its GPX: path, http(s) URL or s3:// URI")
+    s.add_argument("--height", type=float, help="lens height above the road in metres")
+    s.add_argument("--model", type=lambda x: Path(x).expanduser(), help="the YOLO .pt model the job used")
+    s.add_argument("--out", required=True, help="working folder; a second rescore on it reuses the analysed video")
+    s.add_argument("--images", default="s3://photons-bucket-s3", help="where frame_url points: S3 or http(s) base, or a local folder (default %(default)s)")
+    s.add_argument("--rerun", action="store_true", help="analyse the video again even if --out has it")
+    s.add_argument("--fh", type=float, help="use this f*H instead of the GPX one")
+    s.add_argument("--focal", type=float, help="known focal length in px at 1920 wide; replaces the GPX scale")
+    s.add_argument("--gpx-offset", type=float, help="GPX seconds at video start (one recording only)")
+    s.add_argument("--conf", type=float, default=.35, help="confidence to start a track")
+    s.add_argument("--conf-low", type=float, default=.15, help="confidence to continue a track")
+    s.add_argument("--imgsz", type=int, default=640, help="model input size (production uses 640)")
+    s.add_argument("--device", default="auto", help="auto, cpu or cuda")
+    s.add_argument("--aws-profile")
     a = p.parse_args(argv)
     if a.cmd == "run":
         if not .3 <= a.height <= 4:
             p.error("--height is in metres, for example 1.152")
         run(a)
+    elif a.cmd == "rescore":
+        return rescore(a)
     else:
         evaluate_dir(a.out, a.truth, a.outlines, (a.trim_x, a.trim_y))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
