@@ -656,6 +656,7 @@ def _run(a, out, video, gpxfile):
     bounds = [0] + cuts + [n_frames]
     if len(gpx.segments) > 1 or cuts:
         found = align_gpx(recs, gpx, bounds, vid.fps, gap)
+        warnings[:] = [w for w in warnings if not w.startswith("GPX lasts")]      # aligned by speed, not stretched
         if len(cuts) + 1 != len(gpx.segments):
             warnings.append(f"The GPX has {len(gpx.segments)} track segments but the video {len(cuts) + 1} recordings: each recording was matched to the GPX by its speed.")
         for p in found:
@@ -1359,7 +1360,7 @@ def recover_boxes(rows, img, det):
     found = det(img, .05)
     out = {}
     for lab, g in rows.groupby("nlabel"):
-        q = [x for x in found if norm_label(x["label"]) == lab]
+        q = [x for x in found if norm_label(x["label"]) == lab and x["conf"] >= .25]   # production keeps 0.35 and up
         if not q:
             continue
         px = g.defect_area_m2.values * PROD_PPM ** 2
@@ -1438,9 +1439,14 @@ def rescore(a):
             _run(a, out, video, out / "track.gpx")
     else:
         print(f"reusing the analysed video in {out} (pass --rerun to analyse it again)")
-    meta, cam, _, _, _ = load(out)
+    meta, cam, scales, _, normals = load(out)
+    analysed = np.array(sorted(normals))
     C = coefficient_rows(out)
+    if not len(C):                       # nothing tracked: every row falls back to its own view
+        C = pd.DataFrame(columns="track_id label frame time_s conf x1 y1 x2 y2 distance_m pixels area_old area_new width_m length_m cut_by_edge upright".split())
     F = final_areas(C)
+    if not len(F):
+        F = pd.DataFrame(columns="track_id label area_new width_m length_m distance_m views_used spread confidence note".split())
     C.to_csv(out / "coefficients.csv", index=False)
     F.to_csv(out / "defects.csv", index=False)
     C["nlabel"] = C.label.map(norm_label)
@@ -1462,7 +1468,17 @@ def rescore(a):
     if not has_box and not model.is_file():
         raise SystemExit(f"model not found: {model}. Pass --model with the model this video was analysed with.")
     det = None if has_box else Detector(model, a.device, meta.get("imgsz", 640))
-    R = pd.DataFrame(index=d.index, columns="video_frame frame_match track_id frac x1 y1 x2 y2 how note".split(), dtype=object)
+    R = pd.DataFrame(index=d.index, columns="video_frame frame_match track_id frac x1 y1 x2 y2 how note one_area one_length one_width one_distance one_cut".split(), dtype=object)
+
+    def one_view(i, k, b, frac):
+        """The row's own box measured on its own frame: distance-corrected, but a single view."""
+        j = analysed[np.abs(analysed - k).argmin()] if len(analysed) else None
+        m = measure_box(b, normals[j], cam, scales.at(k)) if j is not None and abs(j - k) <= step else None
+        # Farther than 8 m a few pixels of horizon error grow with the cube of the distance: one view is not enough there.
+        if m and 1 <= m["distance"] <= FINAL_RANGE[1]:
+            R.loc[i, ["one_area", "one_length", "one_width", "one_distance", "one_cut"]] = [
+                m["area"] * frac, m["length"], m["width"], m["distance"], bool(b[0] < 8 or b[2] > cam.w - 8 or b[3] > cam.h - 8)]
+
     R["note"] = ""
     for src, g in d.groupby(key):
         img = cv2.imread(str(imgs[src])) if src in imgs else None
@@ -1507,28 +1523,50 @@ def rescore(a):
                 t = x.loc[x.err.idxmin()] if len(x) and x.err.min() < math.log(1.3) else None
                 b, frac, how = None, (min(1.0, px / t.pixels) if t is not None else np.nan), "same class and size"
             if t is None:
-                R.loc[i, "note"] = "the model did not find this box again in the video" if i in boxes else "no box of this class and size in the evidence image"
+                R.loc[i, "note"] = "the model did not track this box in the video" if i in boxes else "no box of this class and size in the evidence image"
+                if i in boxes:
+                    R.loc[i, ["x1", "y1", "x2", "y2"]] = [round(float(v), 1) for v in b]
+                    one_view(i, k, b, frac)
                 continue
             R.loc[i, ["track_id", "frac", "how"]] = [int(t.track_id), frac, how]
             R.loc[i, ["x1", "y1", "x2", "y2"]] = [round(float(v), 1) for v in (b or (t.x1, t.y1, t.x2, t.y2))]
+            if b is not None:
+                one_view(i, k, b, frac)
 
     Fi = F.set_index("track_id")
-    new, conf, notes = [], [], []
+    new, conf, notes, geo, how = [], [], [], [], []
     for i in d.index:
         t, n = R.track_id[i], R.note[i]
         f = Fi.loc[t] if pd.notna(t) and t in Fi.index else None
+        if f is not None and np.isfinite(f.area_new) and f.views_used == 0 and not f.distance_m <= FINAL_RANGE[1]:
+            f = f.copy()
+            f["area_new"], f["note"] = np.nan, f"tracked only from {f.distance_m:.0f} m and farther"
         if f is None or not np.isfinite(f.area_new):
+            if pd.notna(R.one_area[i]):
+                # Seen by the model too briefly to follow: its one view still corrects for distance.
+                new.append(R.one_area[i])
+                ok_range = FINAL_RANGE[0] <= R.one_distance[i] and not R.one_cut[i]
+                conf.append("medium" if ok_range else "low")
+                notes.append("; ".join(x for x in (n if f is None else f.note, f"one view only, {R.one_distance[i]:.1f} m away",
+                                                   "cut by the frame edge: the true area is larger" if R.one_cut[i] else "") if x))
+                geo.append((R.one_length[i], R.one_width[i], R.one_distance[i], 1, np.nan))
+                how.append("one view")
+                continue
             new.append(np.nan)
             conf.append("")
             notes.append(n or (f.note if f is not None else ""))
+            geo.append((np.nan,) * 5)
+            how.append("")
             continue
+        geo.append((f.length_m, f.width_m, f.distance_m, f.views_used, f.spread))
+        how.append("tracked defect")
         new.append(f.area_new * R.frac[i])
         exact = R.how[i] == "same box" and norm_label(f.label) == d.nlabel[i]
         conf.append(f.confidence if exact else {"high": "medium"}.get(f.confidence, "low"))
         notes.append("; ".join(x for x in (f.note, "box partly off the road: scaled by the stored pixels" if R.frac[i] < .9 else "",
                                            f"the model called this spot {f.label} in the frames around it" if norm_label(f.label) != d.nlabel[i] else "",
                                            "matched by class and size only" if R.how[i] != "same box" else "") if x))
-    d["new"], d["conf"], d["note"] = new, conf, notes
+    d["new"], d["conf"], d["note"], d["method"] = new, conf, notes, how
     # Two rows on one tracked defect are the same defect seen twice; the later ones say so.
     first, d["same_as"] = {}, ""
     for i in d.sort_values("id", key=lambda s: pd.to_numeric(s, errors="coerce")).index:
@@ -1555,10 +1593,10 @@ def rescore(a):
     res.insert(at, "defect_area_m2_new", np.where(d.new.notna(), d.new.round(4), d.defect_area_m2))
     res.insert(at + 1, "area_changed", np.where(d.new.notna(), "yes", "no"))
     ratio = d.new / d.defect_area_m2
-    num = lambda s, k: pd.to_numeric(R.track_id.map(Fi[s]), errors="coerce").round(k)
+    G = pd.DataFrame(geo, index=d.index, columns="length_m width_m distance_m views_used spread".split()).astype(float)
     extra = dict(new_over_old=ratio.round(3), estimated_cost_inr_new=np.where(linear & d.new.notna(), (d.new * rate).round(2), cost),
-                 confidence=d.conf, length_m=num("length_m", 2), width_m=num("width_m", 2), distance_m=num("distance_m", 2),
-                 views_used=R.track_id.map(Fi.views_used), spread=num("spread", 3), same_defect_as_id=d.same_as, note=d.note,
+                 confidence=d.conf, method=d.method, length_m=G.length_m.round(2), width_m=G.width_m.round(2), distance_m=G.distance_m.round(2),
+                 views_used=G.views_used.astype("Int64"), spread=G.spread.round(3), same_defect_as_id=d.same_as, note=d.note,
                  video_frame=R.video_frame, frame_match=R.frame_match, track_id=R.track_id, box_x1=R.x1, box_y1=R.y1, box_x2=R.x2, box_y2=R.y2,
                  defect_image=R.track_id.map(lambda t: sheets.get(t, "") if pd.notna(t) else ""))
     for k, v in extra.items():
@@ -1573,7 +1611,8 @@ def rescore(a):
     res.to_csv(path, index=False)
 
     ok = d.new.notna()
-    S = dict(rows=len(d), updated=int(ok.sum()), confidence=res.confidence[ok].value_counts().to_dict(),
+    S = dict(rows=len(d), updated=int(ok.sum()), from_tracked_defect=int((d.method == "tracked defect").sum()), from_one_view=int((d.method == "one view").sum()),
+             confidence=res.confidence[ok].value_counts().to_dict(),
              kept_old=res.note[~ok].replace("", "no usable view").value_counts().to_dict(), same_defect_rows=int((d.same_as != "").sum()),
              by_class={k: dict(rows=len(g), updated=int(g.new.notna().sum()), old_m2=round(float(g.defect_area_m2.sum()), 2),
                                new_m2=round(float(np.where(g.new.notna(), g.new, g.defect_area_m2).sum()), 2),
@@ -1581,7 +1620,8 @@ def rescore(a):
                        for k, g in d.groupby("label")},
              pieces=meta.get("pieces"), warnings=meta["warnings"], csv=path.name)
     (out / "rescore.json").write_text(json.dumps(S, indent=1, default=str))
-    print(f"\n=== {S['updated']} of {S['rows']} rows got a new area; confidence {S['confidence']}")
+    print(f"\n=== {S['updated']} of {S['rows']} rows got a new area ({S['from_tracked_defect']} from a tracked defect, {S['from_one_view']} from one view); "
+          f"confidence {S['confidence']}")
     for k, v in S["kept_old"].items():
         print(f"kept the old area ({v} rows): {k}")
     print(pd.DataFrame(S["by_class"]).T.to_string())
@@ -1635,8 +1675,8 @@ def main(argv=None):
     s.add_argument("--fh", type=float, help="use this f*H instead of the GPX one")
     s.add_argument("--focal", type=float, help="known focal length in px at 1920 wide; replaces the GPX scale")
     s.add_argument("--gpx-offset", type=float, help="GPX seconds at video start (one recording only)")
-    s.add_argument("--conf", type=float, default=.35, help="confidence to start a track")
-    s.add_argument("--conf-low", type=float, default=.15, help="confidence to continue a track")
+    s.add_argument("--conf", type=float, default=.2, help="confidence to start a track (lower than run: only tracks that meet a stored row are used)")
+    s.add_argument("--conf-low", type=float, default=.1, help="confidence to continue a track")
     s.add_argument("--imgsz", type=int, default=640, help="model input size (production uses 640)")
     s.add_argument("--device", default="auto", help="auto, cpu or cuda")
     s.add_argument("--aws-profile")

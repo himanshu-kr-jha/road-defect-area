@@ -105,6 +105,7 @@ It has every column of the input, unchanged, plus these:
 | `defect_area_m2_new` | The corrected area. It equals the old area when the row could not be corrected (see `note`) |
 | `area_changed` | `yes` when the row got a new area |
 | `new_over_old`, `estimated_cost_inr_new` | The change. Cost follows the area only for classes whose stored cost is a fixed rate per m2 |
+| `method` | `tracked defect` (median of its views at 3-8 m) or `one view` (see below) |
 | `confidence`, `views_used`, `spread`, `distance_m`, `length_m`, `width_m` | As in `defects.csv`, for the tracked defect |
 | `same_defect_as_id` | This row is the same tracked defect as an earlier row |
 | `note` | Why the old area was kept, or what to check |
@@ -127,7 +128,11 @@ How each row is found:
 - That box is matched to the box drawn by the run within two analysed frames, which gives the tracked defect.
   The model sometimes calls one spot by another class in the next frames (pothole, then patching).
   When no box of the row's class is there, a box of another class on the same spot is used, the confidence drops one step, and `note` says so.
-- A row the model saw on only one frame, below the confidence that starts a track, has no tracked defect: it keeps its old area.
+- Production saves a defect the first time the model sees it, often a weak detection far away.
+  `rescore` therefore starts tracks at confidence 0.20 (`run` uses 0.35); a track that matches no row is simply not used.
+- A row whose box the run still did not track is measured once, on its own frame, with that frame's horizon (`method` = `one view`).
+  This is done only up to 8 m away: farther, a few pixels of error grow with the cube of the distance.
+  Its confidence is at most `medium`, and `low` when the box is cut by the frame edge.
 - If the stored area is smaller than the box (the part off the road was dropped), the new area is reduced in the same proportion.
 
 The old area is kept for sign boards and garbage piles, which stand above the road.

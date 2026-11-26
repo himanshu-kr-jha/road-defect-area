@@ -335,3 +335,31 @@ def test_rescore_reads_the_workers_own_csv_by_frame_number(result, tmp_path):
     assert path.name == "video_defect_new_area.csv" and list(R.columns[:6]) == ["object_id", "frame", "timestamp", "defect_name", "defect_area_m2", "defect_area_m2_new"]
     assert (R.area_changed == "yes").all() and R.track_id.nunique() == 4
     assert ((R.defect_area_m2_new / [r["true"] for r in rows] - 1).abs() < .2).all()
+
+
+def test_a_row_the_run_never_tracked_is_measured_from_its_one_view_up_to_8_m(result, tmp_path):
+    import shutil
+    out = tmp_path / "run"
+    shutil.copytree(result[0], out)
+    pd.read_csv(out / "detections.csv").iloc[:0].to_csv(out / "detections.csv", index=False)     # the run tracked nothing
+    rows = []
+    for n, (cx, cz, ln, wd) in DEFECTS.items():
+        for want in (6, 12):
+            i = next((i for i in range(0, N, 3) if want - .5 < cz - SPEED * i / FPS < want + .5), None)
+            if i is None:
+                continue
+            p, _ = project(i, outline(n))
+            rows.append(dict(object_id=len(rows) + 1, frame=i, defect_name="Pothole", at=want, true=ln * wd,
+                             defect_area_m2=round(np.ptp(p[:, 0]) * np.ptp(p[:, 1]) / 145 ** 2, 4)))
+    pd.DataFrame(rows).drop(columns=["at", "true"]).to_csv(tmp_path / "rows.csv", index=False)
+    EvidenceDetector.thumbs = np.load(out / "thumbs.npy")
+    ra.Detector, keep = EvidenceDetector, ra.Detector
+    try:
+        path = ra.main(["rescore", "--rows", str(tmp_path / "rows.csv"), "--out", str(out), "--video", str(result[0].parent / "v.mp4"), "--model", __file__])
+    finally:
+        ra.Detector = keep
+    R = pd.read_csv(path).assign(at=[r["at"] for r in rows], true=[r["true"] for r in rows])
+    near, far = R[R["at"] == 6], R[R["at"] == 12]
+    assert len(near) >= 3 and (near.method == "one view").all() and (near.confidence == "medium").all()
+    assert ((near.defect_area_m2_new / near.true - 1).abs() < .2).all()
+    assert len(far) >= 2 and (far.area_changed == "no").all()
